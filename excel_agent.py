@@ -3,16 +3,41 @@ import pandas as pd
 import requests
 import json
 from datetime import datetime
-import io
+import numpy as np
 
 # ========== НАСТРОЙКИ ==========
 YANDEX_API_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-MAX_PREVIEW_ROWS = 5  # Сколько строк показывать в контексте
+MAX_PREVIEW_ROWS = 5
+
+def clean_dataframe(df):
+    """Очистка DataFrame от проблемных данных для отображения"""
+    # Создаем копию
+    df_clean = df.copy()
+    
+    # Удаляем безымянные колонки
+    unnamed_cols = [col for col in df_clean.columns if 'Unnamed' in str(col)]
+    df_clean = df_clean.drop(columns=unnamed_cols, errors='ignore')
+    
+    # Очищаем каждую колонку
+    for col in df_clean.columns:
+        # Преобразуем смешанные типы в строки
+        if df_clean[col].dtype == 'object':
+            try:
+                # Пробуем преобразовать в числа
+                df_clean[col] = pd.to_numeric(df_clean[col], errors='ignore')
+            except:
+                # Если не получается - в строки
+                df_clean[col] = df_clean[col].astype(str)
+        
+        # Заменяем проблемные значения
+        df_clean[col] = df_clean[col].replace([np.inf, -np.inf], np.nan)
+        df_clean[col] = df_clean[col].fillna('')
+    
+    return df_clean
 
 def load_multiple_excel(files):
-    """Загрузка нескольких Excel файлов"""
+    """Загрузка нескольких Excel файлов с очисткой"""
     all_data = {}
-    total_size = 0
     
     for file in files:
         try:
@@ -22,12 +47,13 @@ def load_multiple_excel(files):
             for sheet in xls.sheet_names:
                 df = pd.read_excel(file, sheet_name=sheet)
                 
-                # Ограничиваем для скорости
+                # Ограничиваем размер
                 if len(df) > 5000:
                     df = df.head(5000)
                 
+                # Очищаем данные
+                df = clean_dataframe(df)
                 file_data[sheet] = df
-                total_size += len(df)
             
             all_data[file.name] = {
                 'sheets': file_data,
@@ -42,14 +68,12 @@ def load_multiple_excel(files):
     return all_data
 
 def create_analysis_context(all_data):
-    """Создание контекста для анализа нескольких файлов"""
+    """Создание контекста для анализа"""
     context = "📊 АНАЛИЗ НЕСКОЛЬКИХ EXCEL ФАЙЛОВ\n\n"
     
-    # Общая информация
     context += f"Всего файлов: {len(all_data)}\n"
     context += f"Общее количество листов: {sum(len(data['sheets']) for data in all_data.values())}\n\n"
     
-    # Информация по каждому файлу
     for file_name, data in all_data.items():
         context += f"{'='*50}\n"
         context += f"📁 ФАЙЛ: {file_name}\n"
@@ -62,46 +86,32 @@ def create_analysis_context(all_data):
             context += f"    Размер: {len(df)} строк × {len(df.columns)} колонок\n"
             context += f"    Колонки: {', '.join(df.columns.tolist())}\n"
             
-            # Пример данных
-            context += f"    Первые {MAX_PREVIEW_ROWS} строк:\n"
-            preview = df.head(MAX_PREVIEW_ROWS).to_string(index=False)
-            # Добавляем отступ для читаемости
-            for line in preview.split('\n'):
-                context += f"    {line}\n"
+            # Пример данных (только первые строки и без проблемных данных)
+            try:
+                preview = df.head(MAX_PREVIEW_ROWS).to_string(index=False)
+                context += f"    Первые {MAX_PREVIEW_ROWS} строк:\n"
+                for line in preview.split('\n'):
+                    context += f"    {line}\n"
+            except:
+                context += f"    (не удалось показать пример)\n"
             
-            # Статистика по числам
+            # Статистика только для числовых колонок
             numeric_cols = df.select_dtypes(include=['number']).columns
             if len(numeric_cols) > 0:
-                context += f"    Статистика по числам:\n"
-                stats = df[numeric_cols].describe()
-                for line in stats.to_string().split('\n'):
-                    context += f"    {line}\n"
+                try:
+                    stats = df[numeric_cols].describe()
+                    context += f"    Статистика:\n"
+                    for line in stats.to_string().split('\n'):
+                        context += f"    {line}\n"
+                except:
+                    context += f"    (статистика недоступна)\n"
             
             context += "\n"
-    
-    # Общие колонки для сравнения
-    context += f"{'='*50}\n"
-    context += "🔄 ОБЩИЕ КОЛОНКИ МЕЖДУ ФАЙЛАМИ:\n"
-    
-    all_columns = {}
-    for file_name, data in all_data.items():
-        for sheet_name, df in data['sheets'].items():
-            for col in df.columns:
-                if col not in all_columns:
-                    all_columns[col] = []
-                all_columns[col].append(f"{file_name}/{sheet_name}")
-    
-    common_cols = {col: files for col, files in all_columns.items() if len(files) > 1}
-    if common_cols:
-        for col, files in common_cols.items():
-            context += f"  • '{col}' встречается в: {', '.join(files)}\n"
-    else:
-        context += "  Нет общих колонок\n"
     
     return context
 
 def ask_yandex_gpt(question, context, api_key, folder_id):
-    """Запрос к YandexGPT для анализа нескольких файлов"""
+    """Запрос к YandexGPT"""
     
     system_prompt = (
         "Ты — senior аналитик данных. У тебя есть доступ к нескольким Excel файлам. "
@@ -117,19 +127,7 @@ def ask_yandex_gpt(question, context, api_key, folder_id):
 
 ❓ ВОПРОС ПОЛЬЗОВАТЕЛЯ: {question}
 
-📋 ИНСТРУКЦИИ:
-1. Проанализируй ВСЕ файлы, относящиеся к вопросу
-2. Сравни показатели между файлами, если это уместно
-3. Найди закономерности и аномалии
-4. Используй конкретные числа из данных
-5. Если данных недостаточно — скажи, какой файл нужно добавить
-6. Структурируй ответ:
-   - Краткий вывод
-   - Детальный анализ
-   - Сравнение (если применимо)
-   - Рекомендации
-
-💡 ТВОЙ АНАЛИЗ:
+Дай точный ответ на основе данных. Сравнивай файлы, если вопрос подразумевает сравнение.
 """
     
     headers = {
@@ -142,7 +140,7 @@ def ask_yandex_gpt(question, context, api_key, folder_id):
         "completionOptions": {
             "stream": False,
             "temperature": 0.1,
-            "maxTokens": 3000  # Увеличили для сложного анализа
+            "maxTokens": 3000
         },
         "messages": [
             {"role": "system", "text": system_prompt},
@@ -157,6 +155,28 @@ def ask_yandex_gpt(question, context, api_key, folder_id):
         return result['result']['alternatives'][0]['message']['text']
     except Exception as e:
         return f"❌ Ошибка API: {str(e)[:200]}"
+
+def safe_display_dataframe(df, max_rows=10):
+    """Безопасное отображение DataFrame в Streamlit"""
+    try:
+        # Очищаем данные
+        df_display = clean_dataframe(df)
+        
+        # Показываем только первые строки
+        df_display = df_display.head(max_rows)
+        
+        # Если всё ещё есть проблемы - преобразуем всё в строки
+        try:
+            st.dataframe(df_display, use_container_width=True)
+        except:
+            # Последний рубеж - всё в строки
+            df_string = df_display.astype(str)
+            st.dataframe(df_string, use_container_width=True)
+            
+    except Exception as e:
+        st.error(f"Не удалось отобразить данные: {str(e)[:100]}")
+        st.write("Первые строки в текстовом виде:")
+        st.text(df.head(3).to_string())
 
 # ========== ИНТЕРФЕЙС ==========
 st.set_page_config(
@@ -173,7 +193,6 @@ st.markdown("*YandexGPT • Загрузите до 5 файлов и сравн
 with st.sidebar:
     st.header("⚙️ Настройки API")
     
-    # API ключи
     folder_id = st.text_input(
         "📁 Yandex Folder ID",
         type="password",
@@ -197,7 +216,6 @@ with st.sidebar:
     
     st.divider()
     
-    # Загрузка файлов
     st.header("📁 Файлы")
     uploaded_files = st.file_uploader(
         "Выберите Excel файлы (до 5)",
@@ -230,21 +248,18 @@ with st.sidebar:
                 col2.metric("Листов", total_sheets)
                 col3.metric("Строк", f"{total_rows:,}")
                 
-                # Выбор активного файла для просмотра
+                # Предпросмотр
                 st.subheader("👀 Предпросмотр")
-                selected_file = st.selectbox(
-                    "Файл:",
-                    list(all_data.keys())
-                )
+                selected_file = st.selectbox("Файл:", list(all_data.keys()))
                 
                 if selected_file:
                     selected_sheet = st.selectbox(
                         "Лист:",
                         list(all_data[selected_file]['sheets'].keys())
                     )
-                    st.dataframe(
-                        all_data[selected_file]['sheets'][selected_sheet].head(10),
-                        use_container_width=True
+                    # Используем безопасное отображение
+                    safe_display_dataframe(
+                        all_data[selected_file]['sheets'][selected_sheet]
                     )
     
     st.divider()
@@ -261,18 +276,16 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # Поле ввода
-if prompt := st.chat_input("💬 Задайте вопрос о данных (можно сравнивать файлы)..."):
+if prompt := st.chat_input("💬 Задайте вопрос о данных..."):
     if 'all_data' not in st.session_state:
         st.warning("⚠️ Сначала загрузите Excel файлы")
     elif not st.session_state.get('api_key') or not st.session_state.get('folder_id'):
         st.warning("⚠️ Введите API-ключи в боковой панели")
     else:
-        # Вопрос пользователя
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Ответ агента
         with st.chat_message("assistant"):
             with st.spinner("🤔 Анализирую все файлы..."):
                 response = ask_yandex_gpt(
@@ -298,10 +311,7 @@ if 'all_data' not in st.session_state:
             "Найди общие позиции между файлами",
             "Где максимальные продажи?",
             "Какие данные дублируются?",
-            "Сравни средние значения по месяцам",
-            "Найди расхождения в ценах между файлами",
-            "Покажи топ-5 позиций из всех файлов",
-            "Где больше всего пропущенных данных?"
+            "Сравни средние значения по месяцам"
         ]
         for ex in examples:
             st.code(ex, language=None)
@@ -309,24 +319,8 @@ if 'all_data' not in st.session_state:
     with col2:
         st.subheader("🔍 Что умеет агент:")
         st.markdown("""
-        ✅ **Сравнивать** несколько файлов
-        
-        ✅ **Находить** общие данные
-        
-        ✅ **Выявлять** расхождения
-        
-        ✅ **Анализировать** тренды
-        
-        ✅ **Агрегировать** статистику
-        
-        ✅ **Подсвечивать** аномалии
-        """)
-        
-        st.subheader("📋 Форматы вопросов:")
-        st.markdown("""
-        • "Сравни файл А и файл Б по..."
-        • "Найди общие [колонки/значения]"
-        • "Где больше [показатель]?"
-        • "Посчитай сумму [колонка] по всем файлам"
-        • "Есть ли расхождения в [данные]?"
+        ✅ Сравнивать несколько файлов
+        ✅ Находить общие данные
+        ✅ Выявлять расхождения
+        ✅ Анализировать тренды
         """)
