@@ -1,2 +1,5 @@
-Repository name: excel-ai-agent
-Description: Агент для анализа Excel файлов
+txt
+streamlit
+pandas
+openpyxl
+requests
